@@ -2,15 +2,16 @@ package main
 
 import (
 	"context"
+	crand "crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	mrand "math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	crand "crypto/rand"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -41,15 +42,15 @@ type Lock struct {
 }
 
 func New(addrs []string) *Redlock {
-	clients := make([]*redis.Client, 0, len(addrs))
-	for _, addr := range addrs {
-		clients = append(clients, redis.NewClient(&redis.Options{
+	clients := make([]*redis.Client, len(addrs))
+	for i, addr := range addrs {
+		clients[i] = redis.NewClient(&redis.Options{
 			Addr:         addr,
 			DialTimeout:  100 * time.Millisecond,
 			ReadTimeout:  100 * time.Millisecond,
 			WriteTimeout: 100 * time.Millisecond,
 			MaxRetries:   -1, // disable go-redis internal retries, they would wreck our timing math
-		}))
+		})
 	}
 	return &Redlock{
 		clients:     clients,
@@ -64,7 +65,7 @@ func New(addrs []string) *Redlock {
 
 func (r *Redlock) Close() {
 	for _, c := range r.clients {
-		_ = c.Close()
+		c.Close()
 	}
 }
 
@@ -76,7 +77,7 @@ func (r *Redlock) Close() {
 //  5. on failure, unlock on ALL nodes (even ones we think we failed on,
 //     because the reply may have been lost after the write happened)
 func (r *Redlock) Acquire(ctx context.Context, resource string, ttl time.Duration) (*Lock, error) {
-	for attempt := 0; attempt < r.retries; attempt++ {
+	for attempt := range r.retries {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -116,12 +117,10 @@ func (r *Redlock) Acquire(ctx context.Context, resource string, ttl time.Duratio
 		if attempt < r.retries-1 && r.retryDelay > 0 {
 			// Back off for a random amount up to retryDelay before retrying.
 			delay := time.Duration(mrand.Int63n(int64(r.retryDelay)))
-			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
-				timer.Stop()
 				return nil, ctx.Err()
-			case <-timer.C:
+			case <-time.After(delay):
 			}
 		}
 	}
@@ -134,28 +133,22 @@ func (r *Redlock) Acquire(ctx context.Context, resource string, ttl time.Duratio
 func (r *Redlock) forEachNode(ctx context.Context, fn func(context.Context, *redis.Client) bool) int {
 	var (
 		wg sync.WaitGroup
-		mu sync.Mutex
-		ok int
+		ok atomic.Int32
 	)
 
 	for _, c := range r.clients {
-		wg.Add(1)
-		go func(c *redis.Client) {
-			defer wg.Done()
-
+		wg.Go(func() {
 			nctx, cancel := context.WithTimeout(ctx, r.nodeTimeout)
 			defer cancel()
 
 			if fn(nctx, c) {
-				mu.Lock()
-				ok++
-				mu.Unlock()
+				ok.Add(1)
 			}
-		}(c)
+		})
 	}
 
 	wg.Wait()
-	return ok
+	return int(ok.Load())
 }
 
 // Release unlocks on all N nodes. Safe to call even if some nodes are down:
@@ -170,6 +163,7 @@ func (r *Redlock) release(ctx context.Context, resource, token string) {
 		return err == nil && n == 1
 	})
 }
+
 func getToken() (string, error) {
 	b := make([]byte, 16)
 	if _, err := crand.Read(b); err != nil {
